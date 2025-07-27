@@ -1,49 +1,80 @@
 #include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-// Wi-Fi Settings
-const char* ssid = "Ravindu's Galaxy A12 ";
-const char* password = "smwd3183";
+// WiFi Configuration
+const char* ssid = "YOUR_WIFI";
+const char* password = "YOUR_PASSWORD";
 
-// Raspberry Pi IP and UDP Port
-const char* pi_ip = "192.168.57.191"; 
-const unsigned int udp_port = 12345;
+// MQTT Configuration
+const char* mqtt_server = "RASPBERRY_PI_IP";
+const int mqtt_port = 1883;
+const char* raw_topic = "noise/raw/";
+const char* mode_topic = "noise/mode/";  // For receiving mode commands
 
-WiFiUDP udp;
-
-// Audio Settings
-const int sample_rate = 4000; // Hz
+// Device Configuration
+const char* device_id = "esp-noise-01";
+const int sample_rate = 4000;
 const int samples_per_packet = 128;
 
-void setup() {
-  Serial.begin(115200);
-  delay(10);
+// Operation mode
+String current_mode = "general";  // Default mode
 
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to Wi-Fi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
+  String payloadStr;
   
-  // FIX: Properly print IP address
-  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+  for (int i = 0; i < length; i++) {
+    payloadStr += (char)payload[i];
+  }
+
+  // Check if this is a mode command for our device
+  if (topicStr.equals(String(mode_topic) + device_id)) {
+    if (payloadStr.equals("industrial") || payloadStr.equals("general")) {
+      current_mode = payloadStr;
+      Serial.println("Mode changed to: " + current_mode);
+    }
+  }
 }
 
-void loop() {
-  static int16_t samples[samples_per_packet];
+void setup_wifi() {
+  // ... (same as previous WiFi setup code)
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(device_id)) {
+      Serial.println("MQTT connected");
+      // Subscribe to mode topic
+      client.subscribe((String(mode_topic) + device_id).c_str());
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+void publish_samples(int16_t* samples) {
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = device_id;
+  doc["sample_rate"] = sample_rate;
+  doc["timestamp"] = millis();
+  doc["mode"] = current_mode;  // Include current mode in payload
   
-  // Collect samples
+  JsonArray data = doc.createNestedArray("samples");
   for (int i = 0; i < samples_per_packet; i++) {
-    samples[i] = analogRead(A0); // Read from microphone
-    delayMicroseconds(1000000 / sample_rate); // Control sample rate
+    data.add(samples[i]);
   }
 
-  // Send via UDP
-  udp.beginPacket(pi_ip, udp_port);
-  udp.write((uint8_t*)samples, sizeof(samples));
-  udp.endPacket();
-
-  Serial.printf("Sent %d samples to %s:%d\n", samples_per_packet, pi_ip, udp_port);
+  char payload[1024];
+  size_t n = serializeJson(doc, payload);
+  
+  char topic[50];
+  snprintf(topic, sizeof(topic), "%s%s", raw_topic, device_id);
+  
+  client.publish(topic, (uint8_t*)payload, n, true);
 }
+
+// ... (rest of the ESP code remains the same)
