@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+Raspberry Pi UDP Audio Receiver
+Receives audio data from ESP8266 microphone sensors via UDP
+Stores data as WAV files and provides real-time monitoring
+"""
+
+import socket
+import struct
+import wave
+import threading
+import time
+import os
+from datetime import datetime
+import numpy as np
+import json
+
+class AudioReceiver:
+    def __init__(self, udp_port=12345, sample_rate=8000):
+        # Network settings
+        self.udp_port = udp_port
+        self.sample_rate = sample_rate
+        self.device_id_length = 12
+        self.samples_per_packet = 512
+        
+        # Storage settings
+        self.base_dir = "audio_recordings"
+        self.create_storage_directory()
+        
+        # Device tracking
+        self.devices = {}
+        self.running = True
+        
+        # Statistics
+        self.stats = {
+            'packets_received': 0,
+            'devices_active': 0,
+            'start_time': time.time()
+        }
+        
+        # Create UDP socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('', self.udp_port))
+        
+        print(f"UDP Audio Receiver started on port {self.udp_port}")
+        print(f"Storage directory: {self.base_dir}")
+        
+    def create_storage_directory(self):
+        """Create directory structure for storing audio files"""
+        if not os.path.exists(self.base_dir):
+            os.makedirs(self.base_dir)
+        
+        # Create subdirectories
+        for subdir in ['raw_audio', 'processed', 'logs']:
+            path = os.path.join(self.base_dir, subdir)
+            if not os.path.exists(path):
+                os.makedirs(path)
+    
+    def calculate_db(self, samples):
+        """Calculate dB level from audio samples (matching ESP8266 calculation)"""
+        if len(samples) == 0:
+            return 0.0
+        
+        # Constants matching ESP8266
+        VCC = 3.3
+        ADC_REF = VCC
+        ADC_RESOLUTION = 1023
+        QUIET_AMPLITUDE = 0.0002
+        
+        # Calculate average and convert to voltage
+        average = np.mean(samples)
+        voltage = (average / ADC_RESOLUTION) * ADC_REF
+        voltage_diff = abs(voltage)
+        
+        if voltage_diff <= 0:
+            return 0.0
+        
+        # Calculate dB SPL
+        db = 20.0 * np.log10(voltage_diff / QUIET_AMPLITUDE)
+        return max(0, min(120, db))  # Clamp between 0-120 dB
+    
+    def save_audio_chunk(self, device_id, samples, timestamp):
+        """Save audio samples as WAV file"""
+        filename = f"{device_id}_{timestamp.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.wav"
+        filepath = os.path.join(self.base_dir, 'raw_audio', filename)
+        
+        # Convert int16 samples to bytes for WAV file
+        audio_data = np.array(samples, dtype=np.int16)
+        
+        with wave.open(filepath, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(self.sample_rate)
+            wav_file.writeframes(audio_data.tobytes())
+        
+        return filepath
+    
+    def log_data(self, device_id, db_level, packet_count, timestamp):
+        """Log device data to JSON file"""
+        log_entry = {
+            'timestamp': timestamp.isoformat(),
+            'device_id': device_id,
+            'db_level': round(db_level, 2),
+            'packet_count': packet_count,
+            'samples_per_packet': self.samples_per_packet
+        }
+        
+        # Daily log file
+        log_filename = f"audio_log_{timestamp.strftime('%Y%m%d')}.json"
+        log_filepath = os.path.join(self.base_dir, 'logs', log_filename)
+        
+        # Append to log file
+        with open(log_filepath, 'a') as log_file:
+            json.dump(log_entry, log_file)
+            log_file.write('\n')
+    
+    def update_device_info(self, device_id):
+        """Update device tracking information"""
+        current_time = time.time()
+        
+        if device_id not in self.devices:
+            self.devices[device_id] = {
+                'first_seen': current_time,
+                'last_seen': current_time,
+                'packet_count': 0,
+                'total_samples': 0
+            }
+            print(f"New device detected: {device_id}")
+        
+        self.devices[device_id]['last_seen'] = current_time
+        self.devices[device_id]['packet_count'] += 1
+        self.devices[device_id]['total_samples'] += self.samples_per_packet
+    
+    def receive_audio_data(self):
+        """Main loop to receive UDP packets"""
+        print("Listening for audio data...")
+        
+        while self.running:
+            try:
+                # Receive UDP packet
+                data, addr = self.sock.recvfrom(4096)  # Buffer size
+                timestamp = datetime.now()
+                
+                if len(data) < self.device_id_length:
+                    print(f"Received incomplete packet from {addr}")
+                    continue
+                
+                # Extract device ID (first 12 bytes)
+                device_id = data[:self.device_id_length].decode('utf-8').rstrip('\x00')
+                
+                # Extract audio samples (remaining bytes)
+                audio_data = data[self.device_id_length:]
+                expected_bytes = self.samples_per_packet * 2  # 2 bytes per int16 sample
+                
+                if len(audio_data) != expected_bytes:
+                    print(f"Warning: Expected {expected_bytes} bytes, got {len(audio_data)} from {device_id}")
+                    continue
+                
+                # Convert bytes to int16 samples
+                samples = struct.unpack(f'<{self.samples_per_packet}h', audio_data)
+                samples = list(samples)
+                
+                # Calculate sound level
+                db_level = self.calculate_db(samples)
+                
+                # Update device tracking
+                self.update_device_info(device_id)
+                
+                # Save audio data
+                try:
+                    audio_file = self.save_audio_chunk(device_id, samples, timestamp)
+                    print(f"[{device_id}] dB: {db_level:.1f}, Saved: {os.path.basename(audio_file)}")
+                except Exception as e:
+                    print(f"Error saving audio from {device_id}: {e}")
+                
+                # Log data
+                self.log_data(device_id, db_level, self.devices[device_id]['packet_count'], timestamp)
+                
+                # Update statistics
+                self.stats['packets_received'] += 1
+                self.stats['devices_active'] = len([d for d in self.devices.values() 
+                                                  if time.time() - d['last_seen'] < 30])
+                
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Error receiving data: {e}")
+                time.sleep(1)
+    
+    def print_statistics(self):
+        """Print periodic statistics"""
+        while self.running:
+            time.sleep(10)  # Print stats every 10 seconds
+            
+            uptime = time.time() - self.stats['start_time']
+            print(f"\n--- Statistics (Uptime: {uptime/60:.1f} min) ---")
+            print(f"Total packets received: {self.stats['packets_received']}")
+            print(f"Active devices: {self.stats['devices_active']}")
+            
+            if self.devices:
+                print("Device Summary:")
+                for device_id, info in self.devices.items():
+                    last_seen = time.time() - info['last_seen']
+                    status = "ACTIVE" if last_seen < 30 else "INACTIVE"
+                    print(f"  {device_id}: {info['packet_count']} packets, "
+                          f"Last seen: {last_seen:.1f}s ago [{status}]")
+            print("-" * 40)
+    
+    def start(self):
+        """Start the receiver with statistics monitoring"""
+        # Start statistics thread
+        stats_thread = threading.Thread(target=self.print_statistics, daemon=True)
+        stats_thread.start()
+        
+        try:
+            # Start main receiving loop
+            self.receive_audio_data()
+        except KeyboardInterrupt:
+            print("\nShutting down receiver...")
+            self.running = False
+            self.sock.close()
+    
+    def create_continuous_audio_file(self, device_id, duration_minutes=10):
+        """Create continuous audio file from chunks (optional utility function)"""
+        print(f"Creating continuous audio file for {device_id} ({duration_minutes} min)...")
+        
+        # This is a utility function you can call separately to combine chunks
+        # Implementation would search for recent files from the device and combine them
+        pass
+
+def main():
+    """Main function to start the audio receiver"""
+    print("ESP8266 Audio Receiver for Raspberry Pi")
+    print("=" * 40)
+    
+    # Configuration
+    UDP_PORT = 12345
+    SAMPLE_RATE = 8000
+    
+    # Create and start receiver
+    receiver = AudioReceiver(udp_port=UDP_PORT, sample_rate=SAMPLE_RATE)
+    receiver.start()
+
+if __name__ == "__main__":
+    main()
