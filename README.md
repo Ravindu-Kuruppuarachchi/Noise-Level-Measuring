@@ -9,6 +9,8 @@ A low-cost, cloud-connected device that continuously measures environmental nois
 ![](SPARK.png)
 
 </div>
+
+
 ---
 
 ## ✨ Features
