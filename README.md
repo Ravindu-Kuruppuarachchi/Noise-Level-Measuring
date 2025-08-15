@@ -6,7 +6,7 @@ A low-cost, cloud-connected device that continuously measures environmental nois
 
 <div align="center">
  
-![](SPARK.PNG)
+![](SPARK.png)
 
 </div>
 ---
